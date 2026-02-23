@@ -1,1 +1,1 @@
-personal site, sdi.ng
+personal site - [sdi.ng](sdi.ng)
