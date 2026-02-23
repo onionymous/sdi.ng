@@ -12,24 +12,18 @@ const SETTINGS = {
   glyphs: {
     rate: 0.86,
     density: 1,
-    ambientNumberBias: 0.12,
-    popNumberBias: 0.22
+    ambientNumberBias: 0.18,
+    popNumberBias: 0.3
   },
   drift: {
-    idleFadeDelayMs: 5000,
-    fadeInRate: 1.8,
-    fadeOutRate: 22,
     radius: 80,
-    radiusWobble: 8,
     speedBase: 0.035,
-    speedWobble: 0.02,
-    cursorLerp: 0.18,
     trailWidth: 4,
     trailDecay: 1.2,
     trailLength: 140,
     carSize: 64,
     spriteReferenceSize: 256,
-    spriteForwardOffset: 0,
+    spriteForwardOffset: -Math.PI * 0.5,
     tireRearFromTopPx: 65,
     tireTopFromLeftPx: 65,
     tireBottomFromRightPx: 60
@@ -40,6 +34,34 @@ const SETTINGS = {
     mobileBreakpoint: 720
   }
 };
+
+const TRANSITION = {
+  reentryIdleMs: 1000,
+  nominalFrameMs: 1000 / 60,
+  entrySpeedPxPerMs: 0.44,
+  exitSpeedPxPerMs: 0.52,
+  minPhaseDurationMs: 140,
+  maxPhaseDurationMs: 1800,
+  entryCornerSweepRadians: 1.12,
+  exitCornerSweepRadians: 0.78,
+  entryAccelExponent: 1.55,
+  exitAccelExponent: 1.45,
+  exitPrepBoostScale: 1.58,
+  orbitRecoveryMs: 650,
+  orbitSpeedWaveAmp: 0.18,
+  orbitSpeedWaveFreq: 1.75,
+  orbitSpeedWaveAmp2: 0.06,
+  orbitSpeedWaveFreq2: 4.3,
+  slipExitBlendRadians: 0.55,
+  pointerOutsidePadding: 4
+};
+
+const CARDINAL_TANGENTS = Object.freeze([
+  { theta: -Math.PI * 0.5, edge: "right" },
+  { theta: 0, edge: "bottom" },
+  { theta: Math.PI * 0.5, edge: "left" },
+  { theta: Math.PI, edge: "top" }
+]);
 
 const app = document.getElementById("app");
 const particlesNode = document.getElementById("particles-js");
@@ -79,18 +101,41 @@ const state = {
     x: window.innerWidth * 0.5,
     y: window.innerHeight * 0.5
   },
-  orbitCenter: {
+  runCenter: {
     x: window.innerWidth * 0.5,
     y: window.innerHeight * 0.5
   },
+  runRadius: SETTINGS.drift.radius,
+  runEntryEdge: null,
+  runEntryTheta: 0,
+  runExitTheta: 0,
+  runExitEdge: null,
+  driftRequested: false,
   driftEnabled: false,
+  driftPendingDisable: false,
+  driftPhase: "hidden",
+  phaseStartedAt: 0,
+  phaseDuration: 0,
+  phaseStartTheta: 0,
+  phaseTargetTheta: 0,
+  phaseThetaDelta: 0,
+  entryStart: null,
+  entryTangentPoint: null,
+  entryHeading: 0,
+  entryLineLength: 0,
+  entryArcSpeedScale: 1,
+  exitStart: null,
+  exitHeading: 0,
+  exitEnd: null,
+  exitLineLength: 0,
+  transitionFrame: 0,
   driftTime: 0,
   driftAngle: 0,
+  orbitSpeedScale: 1,
   trailLeft: [],
   trailRight: [],
-  fadeValue: 1,
-  fadeTarget: 1,
-  lastPointerMoveAt: performance.now(),
+  lastCarPose: null,
+  lastPointerMovedAt: performance.now(),
   lastFrameAt: performance.now(),
   particlesInteractive: true,
   ambientGlyphs: [],
@@ -114,6 +159,32 @@ function clamp(value, min, max) {
 
 function rand(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function smoothStep(t) {
+  const clamped = clamp(t, 0, 1);
+  return clamped * clamped * (3 - 2 * clamped);
+}
+
+function normalizeAngle(angle) {
+  const tau = Math.PI * 2;
+  let wrapped = angle;
+  while (wrapped <= -Math.PI) {
+    wrapped += tau;
+  }
+  while (wrapped > Math.PI) {
+    wrapped -= tau;
+  }
+  return wrapped;
+}
+
+function pickRandomEdge() {
+  const edges = ["left", "right", "top", "bottom"];
+  return edges[Math.floor(Math.random() * edges.length)];
 }
 
 function shuffle(list) {
@@ -247,6 +318,7 @@ function resetAmbientGlyph(el, now) {
   const token = randomGlyphToken(SETTINGS.glyphs.ambientNumberBias);
   const numeric = /\d/.test(token);
   el.textContent = token;
+  el.classList.toggle("plus-glyph", token === "+");
   el.style.left = `${rand(2, 98).toFixed(2)}%`;
   el.style.top = `${rand(4, 96).toFixed(2)}%`;
   el.style.fontSize = `${numeric ? rand(10, 12) : rand(10, 16)}px`;
@@ -290,6 +362,7 @@ function spawnPopGlyph() {
 
   el.className = "glyph pop";
   el.textContent = token;
+  el.classList.toggle("plus-glyph", token === "+");
   el.style.left = `${rand(2, 98).toFixed(2)}%`;
   el.style.top = `${rand(6, 95).toFixed(2)}%`;
   el.style.fontSize = `${numeric ? rand(11, 14) : rand(12, 20)}px`;
@@ -501,13 +574,21 @@ function closeWindow(win) {
 function resizeDriftCanvas() {
   driftCanvas.width = window.innerWidth;
   driftCanvas.height = window.innerHeight;
-  if (!state.driftEnabled) {
+  if (state.driftEnabled) {
+    clampRunCenter(state.runCenter, state.runRadius);
+  }
+  if (!state.driftEnabled || state.driftPhase === "hidden") {
     driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
   }
 }
 
-function addTrailPoint(arr, x, y, maxLength) {
-  arr.push({ x, y, life: 1 });
+function clearTrails() {
+  state.trailLeft.length = 0;
+  state.trailRight.length = 0;
+}
+
+function addTrailPoint(arr, x, y, maxLength, life = 1) {
+  arr.push({ x, y, life });
   while (arr.length > maxLength) {
     arr.shift();
   }
@@ -542,113 +623,47 @@ function drawTrail(arr, width, alphaScale) {
   driftContext.restore();
 }
 
-function rotateLocalPoint(cx, cy, rotation, lx, ly) {
-  const cos = Math.cos(rotation);
-  const sin = Math.sin(rotation);
+function getRearTrailPoints(carX, carY, trailHeading) {
+  const ref = SETTINGS.drift.spriteReferenceSize;
+  const size = SETTINGS.drift.carSize;
+  const rearOffset = size * (0.5 - (SETTINGS.drift.tireRearFromTopPx / ref));
+  const leftHalf = size * (0.5 - (SETTINGS.drift.tireTopFromLeftPx / ref));
+  const rightHalf = size * (0.5 - (SETTINGS.drift.tireBottomFromRightPx / ref));
+  const axleHalf = (leftHalf + rightHalf) * 0.5;
+
+  const fx = Math.cos(trailHeading);
+  const fy = Math.sin(trailHeading);
+  const nx = -fy;
+  const ny = fx;
+  const rearX = carX - fx * rearOffset;
+  const rearY = carY - fy * rearOffset;
+
   return {
-    x: cx + lx * cos - ly * sin,
-    y: cy + lx * sin + ly * cos
+    left: {
+      x: rearX + nx * axleHalf,
+      y: rearY + ny * axleHalf
+    },
+    right: {
+      x: rearX - nx * axleHalf,
+      y: rearY - ny * axleHalf
+    }
   };
 }
 
-function drawCarSprite(x, y, rotation, alpha) {
-  if (alpha <= 0.01) {
+function addTrailsFromPose(pose, lifeScale, stride) {
+  state.transitionFrame += 1;
+  if (stride > 1 && state.transitionFrame % stride !== 0) {
     return;
   }
 
-  driftContext.save();
-  driftContext.globalAlpha = alpha;
-  driftContext.translate(x, y);
-  driftContext.rotate(rotation);
-
-  if (carSpriteReady) {
-    const size = SETTINGS.drift.carSize;
-    driftContext.drawImage(carSprite, -size * 0.5, -size * 0.5, size, size);
-  } else {
-    driftContext.fillStyle = "#11161b";
-    driftContext.fillRect(-12, -7, 24, 14);
-  }
-
-  driftContext.restore();
+  const fallbackHeading = pose.rotation - SETTINGS.drift.spriteForwardOffset;
+  const trailHeading = Number.isFinite(pose.trailHeading) ? pose.trailHeading : fallbackHeading;
+  const tires = getRearTrailPoints(pose.x, pose.y, trailHeading);
+  addTrailPoint(state.trailLeft, tires.left.x, tires.left.y, SETTINGS.drift.trailLength, lifeScale);
+  addTrailPoint(state.trailRight, tires.right.x, tires.right.y, SETTINGS.drift.trailLength, lifeScale);
 }
 
-function setDriftMode(enabled) {
-  state.driftEnabled = enabled;
-  driftState.textContent = enabled ? "on" : "off";
-  driftToggle.querySelector("span:last-child").textContent = enabled ? "disable drift mode" : "enable drift mode";
-
-  if (enabled) {
-    driftCanvas.classList.add("drift-front");
-    setParticlesInteractive(false);
-
-    // Reset drift state to current pointer so we don't stamp ghost trails from center.
-    state.trailLeft.length = 0;
-    state.trailRight.length = 0;
-    state.orbitCenter.x = state.pointer.x;
-    state.orbitCenter.y = state.pointer.y;
-    state.driftTime = 0;
-    driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
-
-    const now = performance.now();
-    state.lastPointerMoveAt = now;
-    state.fadeValue = 0;
-    state.fadeTarget = 0;
-  } else {
-    driftCanvas.classList.remove("drift-front");
-    setParticlesInteractive(true);
-    state.trailLeft.length = 0;
-    state.trailRight.length = 0;
-    driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
-  }
-}
-
-function updateDrift(now, deltaSeconds) {
-  driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
-  if (!state.driftEnabled) {
-    return;
-  }
-
-  if (now - state.lastPointerMoveAt >= SETTINGS.drift.idleFadeDelayMs) {
-    state.fadeTarget = 1;
-  }
-
-  const fadeRate = state.fadeTarget > state.fadeValue ? SETTINGS.drift.fadeInRate : SETTINGS.drift.fadeOutRate;
-  state.fadeValue += (state.fadeTarget - state.fadeValue) * (1 - Math.exp(-fadeRate * deltaSeconds));
-  state.fadeValue = clamp(state.fadeValue, 0, 1);
-
-  state.orbitCenter.x += (state.pointer.x - state.orbitCenter.x) * SETTINGS.drift.cursorLerp;
-  state.orbitCenter.y += (state.pointer.y - state.orbitCenter.y) * SETTINGS.drift.cursorLerp;
-
-  state.driftTime += deltaSeconds;
-
-  const radius = SETTINGS.drift.radius + Math.sin(state.driftTime * 1.5) * SETTINGS.drift.radiusWobble;
-  const angularSpeed = SETTINGS.drift.speedBase
-    + Math.sin(state.driftTime * 0.6) * SETTINGS.drift.speedWobble
-    + Math.sin(state.driftTime * 1.2) * (SETTINGS.drift.speedWobble * 0.4);
-
-  state.driftAngle += angularSpeed;
-
-  const carX = state.orbitCenter.x + Math.cos(state.driftAngle) * radius;
-  const carY = state.orbitCenter.y + Math.sin(state.driftAngle) * radius;
-  const heading = state.driftAngle + Math.PI / 2;
-  const carRotation = heading + SETTINGS.drift.spriteForwardOffset;
-
-  const ref = SETTINGS.drift.spriteReferenceSize;
-  const size = SETTINGS.drift.carSize;
-  // Anchors are expressed against the original 256x256 source sprite and
-  // then scaled, so trails stay aligned when carSize changes.
-  const rearTrailX = -size * 0.5 + size * (SETTINGS.drift.tireRearFromTopPx / ref);
-  const topTrailY = -size * 0.5 + size * (SETTINGS.drift.tireTopFromLeftPx / ref);
-  const bottomTrailY = size * 0.5 - size * (SETTINGS.drift.tireBottomFromRightPx / ref);
-
-  const leftTire = rotateLocalPoint(carX, carY, carRotation, rearTrailX, topTrailY);
-  const rightTire = rotateLocalPoint(carX, carY, carRotation, rearTrailX, bottomTrailY);
-
-  if (state.fadeValue > 0.02) {
-    addTrailPoint(state.trailLeft, leftTire.x, leftTire.y, SETTINGS.drift.trailLength);
-    addTrailPoint(state.trailRight, rightTire.x, rightTire.y, SETTINGS.drift.trailLength);
-  }
-
+function decayTrails(deltaSeconds) {
   const decay = 0.6 * SETTINGS.drift.trailDecay;
   for (const point of state.trailLeft) {
     point.life -= decay * deltaSeconds;
@@ -663,10 +678,553 @@ function updateDrift(now, deltaSeconds) {
   while (state.trailRight.length > 0 && state.trailRight[0].life <= 0) {
     state.trailRight.shift();
   }
+}
 
-  drawTrail(state.trailLeft, SETTINGS.drift.trailWidth, state.fadeValue);
-  drawTrail(state.trailRight, SETTINGS.drift.trailWidth, state.fadeValue);
-  drawCarSprite(carX, carY, carRotation, state.fadeValue);
+function drawCarSprite(x, y, rotation, alpha, scale = 1) {
+  if (alpha <= 0.01) {
+    return;
+  }
+
+  driftContext.save();
+  driftContext.globalAlpha = alpha;
+  driftContext.translate(x, y);
+  driftContext.rotate(rotation);
+  driftContext.scale(scale, scale);
+
+  if (carSpriteReady) {
+    const size = SETTINGS.drift.carSize;
+    driftContext.drawImage(carSprite, -size * 0.5, -size * 0.5, size, size);
+  } else {
+    driftContext.fillStyle = "#11161b";
+    driftContext.fillRect(-12, -7, 24, 14);
+  }
+
+  driftContext.restore();
+}
+
+function offscreenMargin() {
+  return Math.max(SETTINGS.drift.carSize * 1.4, 96);
+}
+
+function pointOnCircle(cx, cy, radius, theta) {
+  return {
+    x: cx + Math.cos(theta) * radius,
+    y: cy + Math.sin(theta) * radius
+  };
+}
+
+function distanceBetween(a, b) {
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function headingVector(heading) {
+  return {
+    x: Math.cos(heading),
+    y: Math.sin(heading)
+  };
+}
+
+function inwardHeadingForEdge(edge) {
+  if (edge === "left") {
+    return 0;
+  }
+  if (edge === "right") {
+    return Math.PI;
+  }
+  if (edge === "top") {
+    return Math.PI * 0.5;
+  }
+  return -Math.PI * 0.5;
+}
+
+function entryTangentThetaForEdge(edge) {
+  if (edge === "left") {
+    return -Math.PI * 0.5;
+  }
+  if (edge === "right") {
+    return Math.PI * 0.5;
+  }
+  if (edge === "top") {
+    return 0;
+  }
+  return Math.PI;
+}
+
+function offscreenPointOnEdge(edge, anchor, margin) {
+  if (edge === "left") {
+    return { x: -margin, y: anchor.y };
+  }
+  if (edge === "right") {
+    return { x: driftCanvas.width + margin, y: anchor.y };
+  }
+  if (edge === "top") {
+    return { x: anchor.x, y: -margin };
+  }
+  return { x: anchor.x, y: driftCanvas.height + margin };
+}
+
+function clampRunCenter(center, _radius) {
+  if (!Number.isFinite(center.x) || !Number.isFinite(center.y)) {
+    center.x = Number.isFinite(state.pointer.x) ? state.pointer.x : driftCanvas.width * 0.5;
+    center.y = Number.isFinite(state.pointer.y) ? state.pointer.y : driftCanvas.height * 0.5;
+  }
+}
+
+function positiveAngleDelta(from, to) {
+  const tau = Math.PI * 2;
+  let delta = to - from;
+  while (delta <= 0) {
+    delta += tau;
+  }
+  return delta;
+}
+
+function nextCardinalTheta(currentTheta) {
+  const tau = Math.PI * 2;
+  let bestTheta = currentTheta + tau;
+  let bestDelta = tau;
+
+  for (const item of CARDINAL_TANGENTS) {
+    const cycles = Math.floor((currentTheta - item.theta) / tau) + 1;
+    const candidate = item.theta + cycles * tau;
+    const delta = candidate - currentTheta;
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      bestTheta = candidate;
+    }
+  }
+
+  return bestTheta;
+}
+
+function edgeForExitTheta(theta) {
+  let bestEdge = CARDINAL_TANGENTS[0].edge;
+  let bestDistance = Infinity;
+  for (const item of CARDINAL_TANGENTS) {
+    const distance = Math.abs(normalizeAngle(theta - item.theta));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestEdge = item.edge;
+    }
+  }
+  return bestEdge;
+}
+
+function headingTowardEdge(edge) {
+  if (edge === "right") {
+    return 0;
+  }
+  if (edge === "bottom") {
+    return Math.PI * 0.5;
+  }
+  if (edge === "left") {
+    return Math.PI;
+  }
+  return -Math.PI * 0.5;
+}
+
+function durationFromDistance(distance, speedPxPerMs) {
+  const raw = distance / Math.max(0.001, speedPxPerMs);
+  return clamp(raw, TRANSITION.minPhaseDurationMs, TRANSITION.maxPhaseDurationMs);
+}
+
+function accelProgress(progress, exponent) {
+  const p = clamp(progress, 0, 1);
+  return Math.pow(p, Math.max(1, exponent));
+}
+
+function inverseAccelProgress(distanceRatio, exponent) {
+  const r = clamp(distanceRatio, 0, 1);
+  return Math.pow(r, 1 / Math.max(1, exponent));
+}
+
+function entryArcSpeedScale() {
+  const orbitLinearSpeedPxPerMs = (SETTINGS.drift.speedBase * state.runRadius) / TRANSITION.nominalFrameMs;
+  const endLineSpeedPxPerMs = TRANSITION.entrySpeedPxPerMs * TRANSITION.entryAccelExponent;
+  const desired = endLineSpeedPxPerMs / Math.max(0.001, orbitLinearSpeedPxPerMs);
+  return clamp(desired, 1, 2.4);
+}
+
+function donutSpeedScale() {
+  const t = state.driftTime;
+  const waveA = 1 + Math.sin(t * TRANSITION.orbitSpeedWaveFreq) * TRANSITION.orbitSpeedWaveAmp;
+  const waveB = Math.sin(t * TRANSITION.orbitSpeedWaveFreq2) * TRANSITION.orbitSpeedWaveAmp2;
+  return clamp(waveA + waveB, 0.72, 1.42);
+}
+
+function orbitStep(deltaSeconds, speedScale = 1) {
+  const frameScale = (deltaSeconds * 1000) / TRANSITION.nominalFrameMs;
+  return SETTINGS.drift.speedBase * frameScale * speedScale;
+}
+
+function orbitTravelHeading(theta) {
+  return theta + Math.PI * 0.5;
+}
+
+function orbitPose(theta, slip) {
+  const position = pointOnCircle(state.runCenter.x, state.runCenter.y, state.runRadius, theta);
+  const heading = orbitTravelHeading(theta);
+  return {
+    x: position.x,
+    y: position.y,
+    trailHeading: heading,
+    rotation: heading + slip + SETTINGS.drift.spriteForwardOffset
+  };
+}
+
+function getCurrentOrbitPose() {
+  return orbitPose(state.driftAngle, Math.PI * 0.5);
+}
+
+function isPointerOutsideDonutCircle() {
+  const dx = state.pointer.x - state.runCenter.x;
+  const dy = state.pointer.y - state.runCenter.y;
+  const threshold = state.runRadius + TRANSITION.pointerOutsidePadding;
+  return (dx * dx + dy * dy) > (threshold * threshold);
+}
+
+function buildEntryRoute(center, radius, edge) {
+  const margin = offscreenMargin();
+  const heading = inwardHeadingForEdge(edge);
+  const tangentTheta = entryTangentThetaForEdge(edge);
+  const tangentPoint = pointOnCircle(center.x, center.y, radius, tangentTheta);
+  const start = offscreenPointOnEdge(edge, tangentPoint, margin);
+
+  return {
+    start,
+    tangentPoint,
+    tangentTheta,
+    heading,
+    lineLength: distanceBetween(start, tangentPoint)
+  };
+}
+
+function setDriftPhaseHidden() {
+  state.driftPhase = "hidden";
+  state.phaseStartedAt = 0;
+  state.phaseDuration = 0;
+  state.phaseStartTheta = 0;
+  state.phaseTargetTheta = 0;
+  state.phaseThetaDelta = 0;
+  state.entryStart = null;
+  state.entryTangentPoint = null;
+  state.entryHeading = 0;
+  state.entryLineLength = 0;
+  state.entryArcSpeedScale = 1;
+  state.exitStart = null;
+  state.exitHeading = 0;
+  state.exitEnd = null;
+  state.exitLineLength = 0;
+  state.transitionFrame = 0;
+  state.orbitSpeedScale = 1;
+  state.lastCarPose = null;
+  clearTrails();
+}
+
+function finalizeDriftDisable() {
+  state.driftRequested = false;
+  state.driftEnabled = false;
+  state.driftPendingDisable = false;
+  driftCanvas.classList.remove("drift-front");
+  setParticlesInteractive(true);
+  setDriftPhaseHidden();
+  driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
+}
+
+function startDriftEntry(now) {
+  state.runRadius = SETTINGS.drift.radius;
+  state.runCenter.x = state.pointer.x;
+  state.runCenter.y = state.pointer.y;
+  clampRunCenter(state.runCenter, state.runRadius);
+
+  const edge = pickRandomEdge();
+  const route = buildEntryRoute(state.runCenter, state.runRadius, edge);
+  state.runEntryEdge = edge;
+  state.runEntryTheta = route.tangentTheta;
+
+  state.entryStart = route.start;
+  state.entryTangentPoint = route.tangentPoint;
+  state.entryHeading = route.heading;
+  state.entryLineLength = route.lineLength;
+  state.entryArcSpeedScale = entryArcSpeedScale();
+
+  state.driftPhase = "entering_line";
+  state.phaseStartedAt = now;
+  state.phaseDuration = durationFromDistance(route.lineLength, TRANSITION.entrySpeedPxPerMs);
+  state.phaseStartTheta = 0;
+  state.phaseTargetTheta = 0;
+  state.phaseThetaDelta = 0;
+  state.orbitSpeedScale = 1;
+  state.transitionFrame = 0;
+}
+
+function maybeStartDriftEntry(now) {
+  if (!state.driftEnabled || !state.driftRequested || state.driftPendingDisable) {
+    return;
+  }
+  if (state.driftPhase !== "hidden") {
+    return;
+  }
+  const pointerIdleMs = now - state.lastPointerMovedAt;
+  if (pointerIdleMs >= TRANSITION.reentryIdleMs) {
+    startDriftEntry(now);
+  }
+}
+
+function startOrbitToExitTangent(now) {
+  if (state.driftPhase !== "orbiting") {
+    return;
+  }
+  const targetTheta = nextCardinalTheta(state.driftAngle);
+  state.runExitTheta = targetTheta;
+  state.runExitEdge = edgeForExitTheta(targetTheta);
+  state.phaseStartTheta = state.driftAngle;
+  state.phaseTargetTheta = targetTheta;
+  state.phaseThetaDelta = positiveAngleDelta(state.phaseStartTheta, state.phaseTargetTheta);
+  state.phaseStartedAt = now;
+  state.phaseDuration = 0;
+  state.driftPhase = "orbit_to_exit_tangent";
+}
+
+function startExitLine(now, carryDistance = 0) {
+  const exitStart = pointOnCircle(state.runCenter.x, state.runCenter.y, state.runRadius, state.runExitTheta);
+  const exitEdge = state.runExitEdge || edgeForExitTheta(state.runExitTheta);
+  const exitHeading = headingTowardEdge(exitEdge);
+  const exitEnd = offscreenPointOnEdge(exitEdge, exitStart, offscreenMargin());
+  const lineLength = distanceBetween(exitStart, exitEnd);
+  const clampedCarry = clamp(carryDistance, 0, Math.max(0, lineLength - 0.001));
+  const carryRatio = clampedCarry / Math.max(0.001, lineLength);
+
+  state.exitStart = exitStart;
+  state.exitEnd = exitEnd;
+  state.exitHeading = exitHeading;
+  state.exitLineLength = lineLength;
+  state.driftPhase = "exiting_line";
+  state.phaseDuration = durationFromDistance(lineLength, TRANSITION.exitSpeedPxPerMs);
+  const carryProgress = inverseAccelProgress(carryRatio, TRANSITION.exitAccelExponent);
+  state.phaseStartedAt = now - (state.phaseDuration * carryProgress);
+  state.transitionFrame = 0;
+}
+
+function advanceOrbitAngle(deltaSeconds, speedScale = 1) {
+  state.driftTime += deltaSeconds;
+  const step = orbitStep(deltaSeconds, speedScale);
+  state.driftAngle += step;
+  return step;
+}
+
+function startEnteringCornerArc(now, carrySeconds = 0) {
+  state.driftPhase = "entering_corner_arc";
+  state.phaseStartedAt = now;
+  state.phaseDuration = 0;
+  state.phaseStartTheta = state.runEntryTheta;
+  state.phaseTargetTheta = state.runEntryTheta + TRANSITION.entryCornerSweepRadians;
+  state.phaseThetaDelta = positiveAngleDelta(state.phaseStartTheta, state.phaseTargetTheta);
+  state.driftAngle = state.phaseStartTheta;
+  state.transitionFrame = 0;
+
+  if (carrySeconds > 0) {
+    advanceOrbitAngle(carrySeconds, state.entryArcSpeedScale);
+  }
+}
+
+function onDriftPointerActivity(now) {
+  state.lastPointerMovedAt = now;
+  if (!state.driftEnabled || !state.driftRequested || state.driftPendingDisable) {
+    return;
+  }
+  if (state.driftPhase === "orbiting" && isPointerOutsideDonutCircle()) {
+    startOrbitToExitTangent(now);
+  }
+}
+
+function setDriftMode(enabled) {
+  state.driftRequested = enabled;
+  driftState.textContent = enabled ? "on" : "off";
+  driftToggle.querySelector("span:last-child").textContent = enabled ? "disable drift mode" : "enable drift mode";
+
+  if (enabled) {
+    state.driftPendingDisable = false;
+    driftCanvas.classList.add("drift-front");
+    setParticlesInteractive(false);
+
+    if (!state.driftEnabled) {
+      state.driftEnabled = true;
+      clearTrails();
+      state.driftTime = 0;
+      state.driftAngle = 0;
+      setDriftPhaseHidden();
+      driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
+    }
+
+    maybeStartDriftEntry(performance.now());
+    return;
+  }
+
+  if (!state.driftEnabled) {
+    finalizeDriftDisable();
+    return;
+  }
+
+  state.driftPendingDisable = true;
+  if (state.driftPhase === "orbiting") {
+    startOrbitToExitTangent(performance.now());
+  } else if (state.driftPhase === "hidden") {
+    finalizeDriftDisable();
+  }
+}
+
+function updateDrift(now, deltaSeconds) {
+  driftContext.clearRect(0, 0, driftCanvas.width, driftCanvas.height);
+  if (!state.driftEnabled) {
+    return;
+  }
+
+  if (state.driftPhase === "hidden") {
+    if (!state.driftRequested || state.driftPendingDisable) {
+      finalizeDriftDisable();
+      return;
+    }
+    maybeStartDriftEntry(now);
+  }
+
+  let activePose = null;
+  const trailLife = 0.68;
+
+  if (state.driftPhase === "entering_line" && state.entryStart && state.entryTangentPoint) {
+    const elapsedMs = now - state.phaseStartedAt;
+    const progress = clamp(elapsedMs / Math.max(1, state.phaseDuration), 0, 1);
+    const eased = accelProgress(progress, TRANSITION.entryAccelExponent);
+    activePose = {
+      x: lerp(state.entryStart.x, state.entryTangentPoint.x, eased),
+      y: lerp(state.entryStart.y, state.entryTangentPoint.y, eased),
+      trailHeading: state.entryHeading,
+      rotation: state.entryHeading + SETTINGS.drift.spriteForwardOffset
+    };
+
+    if (progress >= 1) {
+      const carryMs = Math.max(0, elapsedMs - state.phaseDuration);
+      startEnteringCornerArc(now, carryMs / 1000);
+      const arcProgress = clamp(
+        (state.driftAngle - state.phaseStartTheta) / Math.max(0.0001, state.phaseThetaDelta),
+        0,
+        1
+      );
+      const slip = smoothStep(arcProgress) * (Math.PI * 0.5);
+      activePose = orbitPose(state.driftAngle, slip);
+    }
+  } else if (state.driftPhase === "entering_corner_arc") {
+    const progress = clamp(
+      (state.driftAngle - state.phaseStartTheta) / Math.max(0.0001, state.phaseThetaDelta),
+      0,
+      1
+    );
+    const speedScale = state.entryArcSpeedScale;
+    advanceOrbitAngle(deltaSeconds, speedScale);
+
+    if (state.driftAngle >= state.phaseTargetTheta) {
+      const overshootTheta = state.driftAngle - state.phaseTargetTheta;
+      state.driftAngle = state.phaseTargetTheta + Math.max(0, overshootTheta);
+      state.driftPhase = "orbiting";
+      state.orbitSpeedScale = state.entryArcSpeedScale;
+      state.phaseStartedAt = now;
+      state.phaseDuration = 0;
+      state.transitionFrame = 0;
+      activePose = getCurrentOrbitPose();
+      if (state.driftPendingDisable || isPointerOutsideDonutCircle()) {
+        startOrbitToExitTangent(now);
+      }
+    } else {
+      const postProgress = clamp(
+        (state.driftAngle - state.phaseStartTheta) / Math.max(0.0001, state.phaseThetaDelta),
+        0,
+        1
+      );
+      const slip = smoothStep(postProgress) * (Math.PI * 0.5);
+      activePose = orbitPose(state.driftAngle, slip);
+    }
+  } else if (state.driftPhase === "orbiting") {
+    if (state.driftPendingDisable || (state.driftRequested && isPointerOutsideDonutCircle())) {
+      startOrbitToExitTangent(now);
+      activePose = orbitPose(state.driftAngle, Math.PI * 0.5);
+    } else {
+      const recovery = 1 - Math.exp(-deltaSeconds / Math.max(0.001, TRANSITION.orbitRecoveryMs / 1000));
+      state.orbitSpeedScale += (1 - state.orbitSpeedScale) * recovery;
+      const nonlinearScale = donutSpeedScale();
+      advanceOrbitAngle(deltaSeconds, state.orbitSpeedScale * nonlinearScale);
+      activePose = getCurrentOrbitPose();
+    }
+  } else if (state.driftPhase === "orbit_to_exit_tangent") {
+    const remaining = state.phaseTargetTheta - state.driftAngle;
+    if (remaining <= 0) {
+      startExitLine(now, 0);
+    } else {
+      let speedScale = 1;
+      if (remaining <= TRANSITION.exitCornerSweepRadians) {
+        const prepProgress = 1 - (remaining / Math.max(0.0001, TRANSITION.exitCornerSweepRadians));
+        speedScale = lerp(1, TRANSITION.exitPrepBoostScale, smoothStep(prepProgress));
+      }
+
+      advanceOrbitAngle(deltaSeconds, speedScale);
+
+      if (state.driftAngle >= state.phaseTargetTheta) {
+        const overshootTheta = state.driftAngle - state.phaseTargetTheta;
+        state.driftAngle = state.phaseTargetTheta;
+        startExitLine(now, overshootTheta * state.runRadius);
+      } else {
+        const remainingAfter = state.phaseTargetTheta - state.driftAngle;
+        let slip = Math.PI * 0.5;
+        if (remainingAfter <= TRANSITION.slipExitBlendRadians) {
+          const blendProgress = 1 - (remainingAfter / Math.max(0.0001, TRANSITION.slipExitBlendRadians));
+          slip = lerp(Math.PI * 0.5, 0, smoothStep(blendProgress));
+        }
+        activePose = orbitPose(state.driftAngle, slip);
+      }
+    }
+
+    if (!activePose && state.driftPhase === "exiting_line" && state.exitStart && state.exitEnd) {
+      const progress = clamp((now - state.phaseStartedAt) / Math.max(1, state.phaseDuration), 0, 1);
+      const eased = accelProgress(progress, TRANSITION.exitAccelExponent);
+      activePose = {
+        x: lerp(state.exitStart.x, state.exitEnd.x, eased),
+        y: lerp(state.exitStart.y, state.exitEnd.y, eased),
+        trailHeading: state.exitHeading,
+        rotation: state.exitHeading + SETTINGS.drift.spriteForwardOffset
+      };
+    }
+  } else if (state.driftPhase === "exiting_line" && state.exitStart && state.exitEnd) {
+    const elapsedMs = now - state.phaseStartedAt;
+    const progress = clamp(elapsedMs / Math.max(1, state.phaseDuration), 0, 1);
+    const eased = accelProgress(progress, TRANSITION.exitAccelExponent);
+    activePose = {
+      x: lerp(state.exitStart.x, state.exitEnd.x, eased),
+      y: lerp(state.exitStart.y, state.exitEnd.y, eased),
+      trailHeading: state.exitHeading,
+      rotation: state.exitHeading + SETTINGS.drift.spriteForwardOffset
+    };
+
+    if (progress >= 1) {
+      if (!state.driftRequested || state.driftPendingDisable) {
+        finalizeDriftDisable();
+      } else {
+        setDriftPhaseHidden();
+      }
+      activePose = null;
+    }
+  }
+
+  if (activePose) {
+    addTrailsFromPose(activePose, trailLife, 1);
+    state.lastCarPose = activePose;
+  }
+
+  decayTrails(deltaSeconds);
+  drawTrail(state.trailLeft, SETTINGS.drift.trailWidth, 1);
+  drawTrail(state.trailRight, SETTINGS.drift.trailWidth, 1);
+
+  if (activePose) {
+    drawCarSprite(activePose.x, activePose.y, activePose.rotation, 1);
+  }
 }
 
 function updateSFTime() {
@@ -693,7 +1251,7 @@ function initWindowControls() {
   });
 
   driftToggle.addEventListener("click", () => {
-    setDriftMode(!state.driftEnabled);
+    setDriftMode(!state.driftRequested);
   });
 
   windows.forEach((win) => {
@@ -727,15 +1285,13 @@ function initDragging() {
 
   window.addEventListener("pointermove", (event) => {
     positionCursor(event.clientX, event.clientY);
-    state.lastPointerMoveAt = performance.now();
-    state.fadeTarget = 0;
+    onDriftPointerActivity(performance.now());
     onDragMove(event);
   });
 
   window.addEventListener("pointerdown", (event) => {
     positionCursor(event.clientX, event.clientY);
-    state.lastPointerMoveAt = performance.now();
-    state.fadeTarget = 0;
+    state.lastPointerMovedAt = performance.now();
   });
 
   window.addEventListener("pointerup", endDrag);
