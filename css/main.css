@@ -88,11 +88,15 @@ textarea {
 .glyph {
   position: absolute;
   transform: translate(-50%, -50%);
-  color: rgba(28, 33, 39, 0.2);
+  color: rgba(28, 33, 39, 0.48);
   text-shadow: 0 0 0.5px rgba(255, 255, 255, 0.84);
   user-select: none;
   white-space: nowrap;
   font-weight: 500;
+}
+
+.glyph.plus-glyph {
+  color: rgba(28, 33, 39, 0.62);
 }
 
 .glyph.ambient {
@@ -193,10 +197,6 @@ textarea {
 
 #emailWindow {
   width: min(280px, calc(100vw - 20px));
-}
-
-#aestheticWindow {
-  display: none;
 }
 
 .title {
