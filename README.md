@@ -1,1 +1,1 @@
-personal site - [sdi.ng](sdi.ng)
+personal site - [sdi.ng](http://sdi.ng)
